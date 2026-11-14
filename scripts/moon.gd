@@ -67,6 +67,9 @@ var _detail_mat: ShaderMaterial
 var _col_mips: Array = []                    # PackedByteArray per mip level 1..n (level 0 is _col)
 var _mip_w := PackedInt32Array()
 var _mip_h := PackedInt32Array()
+var _h_mips: Array = []                      # PackedFloat32Array per heightmap mip level 1..n
+var _hm_w := PackedInt32Array()
+var _hm_h := PackedInt32Array()
 var _height_tex: ImageTexture
 var _rmin := 1.0
 var _rmax := 1.0
@@ -96,6 +99,7 @@ func _ready() -> void:
 	_spread = maxf(TAU / segments, ring_growth - 1.0)
 	if _has_color:
 		_build_color_mips()
+	_build_height_mips()
 
 	_mi = MeshInstance3D.new(); _mi.top_level = true
 	_mi.material_override = material if material else _default_material()
@@ -261,6 +265,60 @@ func _sample_color_lod(dir: Vector3, lod: float) -> Color:
 	return c0.lerp(_sample_level(dir, l1), lc - float(l0))
 
 
+# Area-averaged copies of the heightmap. Far mesh rings are many texels apart, so point-sampling
+# the heightmap there aliases small craters into random lumpy (grainy) shading and silhouettes.
+func _build_height_mips() -> void:
+	var img := Image.create_from_data(_w, _h, false, Image.FORMAT_RF, _data.to_byte_array())
+	img.generate_mipmaps()
+	var all := img.get_data()
+	var n := img.get_mipmap_count()
+	_h_mips.clear(); _hm_w.clear(); _hm_h.clear()
+	for l in range(1, n + 1):
+		var w := maxi(_w >> l, 1)
+		var h := maxi(_h >> l, 1)
+		var start := img.get_mipmap_offset(l)
+		_h_mips.append(all.slice(start, start + w * h * 4).to_float32_array())
+		_hm_w.append(w)
+		_hm_h.append(h)
+
+
+# Raw heightmap value at one level (0 = full res, bicubic; >=1 = mip, bilinear). Thread-safe.
+func _rm_level(dir: Vector3, level: int) -> float:
+	var lon := atan2(dir.x, dir.z)
+	var lat := asin(clampf(dir.y, -1.0, 1.0))
+	if level == 0:
+		var u0 := (lon / TAU + 0.5) * _w - 0.5
+		var v0 := (0.5 - lat / PI) * _h - 0.5
+		var xi := int(floor(u0)); var yi := int(floor(v0))
+		return _bicubic(xi, yi, u0 - xi, v0 - yi)
+	var w := _hm_w[level - 1]
+	var h := _hm_h[level - 1]
+	var d: PackedFloat32Array = _h_mips[level - 1]
+	var u := (lon / TAU + 0.5) * w - 0.5
+	var v := (0.5 - lat / PI) * h - 0.5
+	var x0 := int(floor(u)); var y0 := int(floor(v))
+	var fx := u - x0; var fy := v - y0
+	var xa := posmod(x0, w); var xb := posmod(x0 + 1, w)
+	var ya := clampi(y0, 0, h - 1); var yb := clampi(y0 + 1, 0, h - 1)
+	var top := lerpf(d[ya * w + xa], d[ya * w + xb], fx)
+	var bot := lerpf(d[yb * w + xa], d[yb * w + xb], fx)
+	return lerpf(top, bot, fy)
+
+
+# Surface radius in metres at a level of detail (matched to the local mesh spacing). Thread-safe.
+func _sample_m_lod(dir: Vector3, lod: float) -> float:
+	var maxl := _h_mips.size()
+	if lod <= 0.0 or maxl == 0:
+		return _sample_m(dir)
+	var lc := clampf(lod, 0.0, float(maxl))
+	var l0 := int(floor(lc))
+	var l1 := mini(l0 + 1, maxl)
+	var rm := _rm_level(dir, l0)
+	if l1 != l0:
+		rm = lerpf(rm, _rm_level(dir, l1), lc - float(l0))
+	return planet_radius_m * (1.0 + (rm / _mean - 1.0) * height_exaggeration)
+
+
 func _build_job(cx: float, cy: float, cz: float) -> Dictionary:
 	var cl := sqrt(cx * cx + cy * cy + cz * cz)
 	var n := Vector3(cx / cl, cy / cl, cz / cl)
@@ -304,7 +362,7 @@ func _build_job(cx: float, cy: float, cz: float) -> Dictionary:
 			var dir := n * ct + tang * st
 			if _has_color:
 				cols[1 + i * S + j] = _sample_color_lod(dir, lods[i])
-			var r := _sample_m(dir)
+			var r := _sample_m_lod(dir, lods[i])
 			# position relative to mesh origin, kept small near the player
 			verts[1 + i * S + j] = n * (r * ct - rc) + tang * (r * st)
 

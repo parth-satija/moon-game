@@ -1,0 +1,748 @@
+shader_type spatial;
+render_mode specular_disabled;
+
+// Stylized lunar surface.
+//
+// Same procedural terrain as before (craters, boulders, regolith, all generated in true
+// planet space), but rendered as a painted / cel-shaded look:
+//   - banded toon lighting with soft band edges and a cool, tinted shadow side
+//   - base darkness (modelled from topography, or from the color map) goes through a 4-stop palette and is posterized into flat steps
+//   - crater rims and boulder bases get an "ink" outline
+//   - fresh craters get bright cream ejecta, albedo variation is blocky patches, not noise
+//   - a thin rim light on the sunlit limb
+// Relief only changes the NORMAL (no geometry), so collision is unaffected.
+
+// ---- base color / palette ----
+uniform float use_vertex_color = 1.0;                 // set by moon.gd
+uniform vec3 fallback_color : source_color = vec3(0.55, 0.55, 0.53);
+uniform float albedo_gain : hint_range(0.2, 3.0) = 1.0;
+uniform float color_saturation : hint_range(0.0, 3.0) = 1.4;
+
+uniform float palette_mix : hint_range(0.0, 1.0) = 0.7;     // 0 = raw color map, 1 = pure palette
+uniform float color_blend : hint_range(0.0, 1.0) = 1.0;     // 0 = flat posterized color steps, 1 = fully smooth blended colors
+uniform int palette_steps : hint_range(2, 10) = 5;          // flat color steps
+uniform float lum_min : hint_range(0.0, 1.0) = 0.05;        // map luminance mapped to palette start
+uniform float lum_max : hint_range(0.0, 1.0) = 0.6;         // ... and palette end (tune to your map)
+uniform vec3 pal0 : source_color = vec3(0.21, 0.20, 0.19);  // maria / darkest: basaltic grey-brown
+uniform vec3 pal1 : source_color = vec3(0.37, 0.36, 0.34);  // mid grey regolith
+uniform vec3 pal2 : source_color = vec3(0.57, 0.55, 0.52);  // light dust
+uniform vec3 pal3 : source_color = vec3(0.78, 0.76, 0.72);  // highlands / brightest: pale grey
+
+// ---- far-range photo map (moon_preview.png, equirectangular, same lon/lat layout as the heightmap) ----
+// Wrapped around the globe and used wherever the surface is far from the camera. It fades out
+// up close (map_fade_start..map_fade_end below), where the procedural surface takes over.
+uniform sampler2D moon_tex : source_color, filter_linear_mipmap, repeat_enable;
+uniform float tex_amount : hint_range(0.0, 1.0) = 1.0;      // 0 = old palette look, 1 = fully the photo map
+uniform float tex_gain : hint_range(0.2, 4.0) = 1.25;       // brightness of the map
+uniform float tex_contrast : hint_range(0.5, 2.0) = 1.1;    // contrast around mid grey
+uniform float tex_lod_bias : hint_range(0.0, 3.0) = 0.75;   // >0 = blurrier map from afar (stops shimmer/grain)
+uniform vec3 tex_tint : source_color = vec3(1.0, 0.98, 0.94); // slight warm grey, never blue
+
+// ---- toon lighting ----
+// Within map_fade_start metres of the camera the global color map is ignored entirely and
+// the surface colors itself; it blends back to the map by map_fade_end.
+uniform float map_fade_start : hint_range(0.0, 2000.0) = 60.0;
+uniform float map_fade_end : hint_range(1.0, 10000.0) = 500.0;
+uniform float close_value : hint_range(0.0, 1.0) = 0.5;        // palette position of the close-range base color
+uniform float close_variation : hint_range(0.0, 1.0) = 0.5;    // patchiness of the close-range color
+
+// ---- topography -> albedo model (replaces the color map when use_topo_albedo is on) ----
+// Darkness is predicted from the heightmap using trends measured by NASA's LRO instruments:
+//  - LOLA 1064 nm normal albedo (Lucey et al. 2014): highlands ~0.30, maria ~0.15, about half.
+//  - Maria are smooth plains filling low basins, 1-4 km below the surrounding highlands.
+//  - LOLA roughness (Rosenburg et al. 2011): maria median slope <=3 deg, highlands ~7.5 deg.
+//  - Steep slopes shed mature regolith by mass wasting, exposing brighter, fresher material.
+// Not predictable from topography, so not modelled: crater rays, swirls, titanium content.
+// The thresholds below are tunable approximations of those trends, not a NASA lookup table.
+uniform sampler2D height_tex : filter_linear_mipmap, repeat_enable;
+uniform float use_topo_albedo = 0.0;               // set by moon.gd once the height texture exists
+uniform float h_mean = 1.0;                        // heightmap mean radius (model units)
+uniform float km_per_unit = 1.0;                   // model units -> REAL km (exaggeration removed)
+uniform vec2 tex_size = vec2(8192.0, 4096.0);
+uniform float texel_m = 1330.0;                    // metres per heightmap texel (game world)
+uniform vec3 off_full = vec3(0.0);                 // true position of the engine origin
+
+uniform float albedo_highland : hint_range(0.05, 0.6) = 0.30;
+uniform float albedo_mare : hint_range(0.05, 0.6) = 0.15;
+uniform float albedo_dark : hint_range(0.0, 0.6) = 0.12;     // albedo mapped to palette start
+uniform float albedo_bright : hint_range(0.05, 0.8) = 0.36;  // albedo mapped to palette end
+uniform float mare_elev_full_km : hint_range(-8.0, 4.0) = -1.5;   // at/below: fully mare-like elevation
+uniform float mare_elev_none_km : hint_range(-8.0, 6.0) = 0.5;    // at/above: not mare-like
+uniform float smooth_full_deg : hint_range(0.0, 10.0) = 1.0;      // km-scale slope: fully smooth
+uniform float smooth_none_deg : hint_range(0.5, 20.0) = 4.0;      // km-scale slope: fully rough
+uniform float rough_lod : hint_range(0.0, 6.0) = 2.0;             // mip used for roughness (2 = ~10 km baseline)
+uniform float lowland_rough_floor : hint_range(0.0, 1.0) = 0.25;  // how dark a low-but-rough area gets
+uniform float slope_bright_start_deg : hint_range(0.0, 40.0) = 10.0;
+uniform float slope_bright_full_deg : hint_range(1.0, 60.0) = 25.0;
+uniform float slope_bright_gain : hint_range(0.0, 1.5) = 0.35;
+
+uniform float light_blend : hint_range(0.0, 1.0) = 1.0;     // 0 = banded toon lighting, 1 = smooth lighting
+uniform int light_bands : hint_range(2, 8) = 4;
+uniform float band_softness : hint_range(0.0, 0.5) = 0.06;
+uniform vec3 shadow_tint : source_color = vec3(0.45, 0.43, 0.41);   // neutral warm grey in shadow (no blue)
+uniform float shadow_fill : hint_range(0.0, 1.0) = 0.06;
+uniform vec3 rim_color : source_color = vec3(0.85, 0.83, 0.80);
+uniform float rim_strength : hint_range(0.0, 1.5) = 0.08;
+
+// ---- ink / detail ----
+uniform vec3 ink_color : source_color = vec3(0.07, 0.065, 0.06);
+uniform float ink_strength : hint_range(0.0, 1.0) = 0.25;
+uniform float detail_albedo : hint_range(0.0, 1.0) = 0.45;
+uniform float detail_normal : hint_range(0.0, 3.0) = 1.3;
+uniform float regolith_amount : hint_range(0.0, 3.0) = 0.35;      // low = cleaner, more graphic
+uniform float crater_amount : hint_range(0.0, 3.0) = 1.4;
+uniform float crater_density : hint_range(0.0, 1.0) = 0.6;
+uniform float rock_amount : hint_range(0.0, 3.0) = 1.0;
+uniform float rock_density : hint_range(0.0, 1.0) = 0.3;
+
+// True position of the engine origin, reduced in doubles on the CPU (moon.gd).
+uniform vec3 off_a = vec3(0.0);   // mod 4096 m
+uniform vec3 off_b = vec3(0.0);   // mod 262144 m
+
+varying vec3 v_col;
+
+// ------------------------------------------------------------------ vertex displacement
+// Real geometry on the mesh vertices: rolling relief, random small mounds and hollows, and craters.
+// moon.gd mirrors this exact function on the CPU for collision (KEEP THEM IN SYNC), so it uses an
+// integer hash (identical on GPU and CPU) and is placed in TRUE planet space (vmo_* = the mesh
+// origin's position). Each feature fades out where the mesh is too coarse to represent it, and the
+// normal is recomputed analytically, so the terrain shades smoothly across the vertices.
+// All vtx_* / vmo_* uniforms are set by moon.gd.
+uniform float vtx_amount = 0.0;
+uniform float vtx_slope = 0.06;
+uniform float vtx_bumps = 1.0;
+uniform float vtx_bump_density = 0.4;
+uniform float vtx_crater_depth = 1.0;
+uniform float vtx_crater_density = 0.45;
+uniform float vtx_first_ring = 3.0;
+uniform float vtx_spread = 0.049;
+uniform vec3 vmo_a = vec3(0.0);      // mesh origin true position, mod 4096 m
+uniform vec3 vmo_b = vec3(0.0);      // ... mod 262144 m
+uniform vec3 vmo_full = vec3(0.0);   // ... unreduced (only used for the radial direction)
+
+// Mid/far relief (visual only, NOT mirrored in collision): fades in between 300 m and 700 m from the
+// mesh centre, so the collision zone (<= detail_collision_radius_m = 300 m) is never affected.
+uniform float vtx_far_amount : hint_range(0.0, 3.0) = 1.0;       // overall strength of the large-scale relief
+uniform float vtx_far_crater_density : hint_range(0.0, 1.0) = 0.35;
+uniform float vtx_far_crater_depth : hint_range(0.0, 2.0) = 1.0;
+
+uint pcg(uint v) {
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+float h01(uint h) {
+	return float(h >> 8u) * (1.0 / 16777216.0);
+}
+
+// Hash of lattice cell c, wrapped every (mask + 1) cells.
+uint ihash(ivec3 c, int mask, uint seed) {
+	ivec3 w = c & ivec3(mask);
+	return pcg(uint(w.x) + pcg(uint(w.y) + pcg(uint(w.z) + seed)));
+}
+
+// 3D value noise with analytic derivative: (value 0..1, d/dp in cell units).
+vec4 vn(vec3 p, int mask, uint seed) {
+	vec3 fl = floor(p);
+	ivec3 i = ivec3(fl);
+	vec3 f = p - fl;
+	vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	vec3 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+	float a = h01(ihash(i, mask, seed));
+	float b = h01(ihash(i + ivec3(1, 0, 0), mask, seed));
+	float c = h01(ihash(i + ivec3(0, 1, 0), mask, seed));
+	float d = h01(ihash(i + ivec3(1, 1, 0), mask, seed));
+	float e = h01(ihash(i + ivec3(0, 0, 1), mask, seed));
+	float f1 = h01(ihash(i + ivec3(1, 0, 1), mask, seed));
+	float g = h01(ihash(i + ivec3(0, 1, 1), mask, seed));
+	float h = h01(ihash(i + ivec3(1, 1, 1), mask, seed));
+
+	float k1 = b - a;
+	float k2 = c - a;
+	float k3 = e - a;
+	float k4 = a - b - c + d;
+	float k5 = a - c - e + g;
+	float k6 = a - b - e + f1;
+	float k7 = -a + b + c - d + e - f1 - g + h;
+
+	float v = a + k1 * u.x + k2 * u.y + k3 * u.z
+			+ k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x
+			+ k7 * u.x * u.y * u.z;
+	vec3 dv = du * vec3(
+			k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+			k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+			k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+	return vec4(v, dv);
+}
+
+// Rolling relief octave: wavelength ~ cell, steepness set by vtx_slope. -> (height, gradient)
+vec4 und_octave(vec3 p, float cell, int mask, uint seed, float s) {
+	float fade = smoothstep(2.0 * s, 6.0 * s, cell);
+	if (fade <= 0.0) {
+		return vec4(0.0);
+	}
+	float amp = vtx_slope * cell * 0.35 * fade;
+	vec4 n = vn(p / cell, mask, seed);
+	return vec4(amp * (n.x - 0.5), amp * n.yzw / cell);
+}
+
+// Random small mounds (70%) and shallow hollows (30%), smooth compact bumps.
+vec4 bump_layer(vec3 p, float cell, int mask, uint seed, float s) {
+	float fade = smoothstep(2.0 * s, 6.0 * s, cell * 0.4);
+	if (fade <= 0.0 || vtx_bumps <= 0.0) {
+		return vec4(0.0);
+	}
+	vec3 q = p / cell;
+	vec3 fl = floor(q);
+	ivec3 i0 = ivec3(fl);
+	ivec3 st = ivec3(step(vec3(0.5), q - fl) * 2.0 - 1.0);
+	vec4 acc = vec4(0.0);
+
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			for (int c = 0; c < 2; c++) {
+				ivec3 cc = i0 + ivec3(a, b, c) * st;
+				uint h0 = ihash(cc, mask, seed);
+				if (h01(h0) > vtx_bump_density) {
+					continue;
+				}
+				uint r1 = pcg(h0);
+				uint r2 = pcg(r1);
+				uint r3 = pcg(r2);
+				uint r4 = pcg(r3);
+				uint r5 = pcg(r4);
+				uint r6 = pcg(r5);
+				vec3 center = vec3(cc) + 0.2 + 0.6 * vec3(h01(r1), h01(r2), h01(r3));
+				vec3 dv = (q - center) * cell;
+				float R = cell * (0.08 + 0.2 * h01(r4));
+				float x2 = dot(dv, dv) / (R * R);
+				if (x2 >= 1.0) {
+					continue;
+				}
+				float H = R * (0.05 + 0.15 * h01(r6)) * (h01(r5) < 0.7 ? 1.0 : -0.6);
+				float w = 1.0 - x2;
+				acc.x += fade * H * w * w;
+				acc.yzw += fade * H * (-4.0 * w) * dv / (R * R);
+			}
+		}
+	}
+	return acc * vtx_bumps;
+}
+
+// Craters: parabolic bowl with a raised rim.
+vec4 vcrater_layer(vec3 p, float cell, int mask, uint seed, float s) {
+	float fade = smoothstep(2.0 * s, 6.0 * s, cell * 0.2);
+	if (fade <= 0.0 || vtx_crater_depth <= 0.0) {
+		return vec4(0.0);
+	}
+	vec3 q = p / cell;
+	vec3 fl = floor(q);
+	ivec3 i0 = ivec3(fl);
+	ivec3 st = ivec3(step(vec3(0.5), q - fl) * 2.0 - 1.0);
+	vec4 acc = vec4(0.0);
+
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			for (int c = 0; c < 2; c++) {
+				ivec3 cc = i0 + ivec3(a, b, c) * st;
+				uint h0 = ihash(cc, mask, seed);
+				if (h01(h0) > vtx_crater_density) {
+					continue;
+				}
+				uint r1 = pcg(h0);
+				uint r2 = pcg(r1);
+				uint r3 = pcg(r2);
+				uint r4 = pcg(r3);
+				uint r5 = pcg(r4);
+				vec3 center = vec3(cc) + 0.15 + 0.7 * vec3(h01(r1), h01(r2), h01(r3));
+				vec3 dv = (q - center) * cell;
+				float dl = max(length(dv), 1e-4);
+				float R = cell * (0.07 + 0.2 * h01(r4));
+				float x = dl / R;
+				if (x > 1.9) {
+					continue;
+				}
+				float dr = mix(0.05, 0.14, h01(r5)) * vtx_crater_depth;
+				float inside = x < 1.0 ? 1.0 : 0.0;
+				float t = (x - 1.0) / 0.3;
+				float rim = 0.35 * dr * exp(-t * t);
+				float f = inside * dr * (x * x - 1.0) + rim;
+				float df = inside * dr * 2.0 * x + rim * (-2.0 * t / 0.3);
+				acc.x += fade * R * f;
+				acc.yzw += fade * df * (dv / dl);
+			}
+		}
+	}
+	return acc;
+}
+
+// Realistic large craters: bowl, raised rim, power-law ejecta blanket falling off with distance,
+// and a central peak on about a third of them. Heights/gradients are analytic like the layers above.
+vec4 vcrater_real(vec3 p, float cell, int mask, uint seed, float s, float density, float depth_scale) {
+	float fade = smoothstep(2.0 * s, 6.0 * s, cell * 0.2);
+	if (fade <= 0.0 || vtx_far_crater_depth <= 0.0) {
+		return vec4(0.0);
+	}
+	vec3 q = p / cell;
+	vec3 fl = floor(q);
+	ivec3 i0 = ivec3(fl);
+	ivec3 st = ivec3(step(vec3(0.5), q - fl) * 2.0 - 1.0);
+	vec4 acc = vec4(0.0);
+
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			for (int c = 0; c < 2; c++) {
+				ivec3 cc = i0 + ivec3(a, b, c) * st;
+				uint h0 = ihash(cc, mask, seed);
+				if (h01(h0) > density) {
+					continue;
+				}
+				uint r1 = pcg(h0);
+				uint r2 = pcg(r1);
+				uint r3 = pcg(r2);
+				uint r4 = pcg(r3);
+				uint r5 = pcg(r4);
+				uint r6 = pcg(r5);
+				vec3 center = vec3(cc) + 0.15 + 0.7 * vec3(h01(r1), h01(r2), h01(r3));
+				vec3 dv = (q - center) * cell;
+				float dl = max(length(dv), 1e-4);
+				float R = cell * (0.07 + 0.2 * h01(r4));
+				float x = dl / R;
+				if (x > 1.9) {
+					continue;
+				}
+				float dr = mix(0.05, 0.14, h01(r5)) * depth_scale * vtx_far_crater_depth;
+
+				// raised rim (both sides of x = 1)
+				float t = (x - 1.0) / 0.3;
+				float rim = 0.35 * dr * exp(-t * t);
+				float f = rim;
+				float df = rim * (-2.0 * t / 0.3);
+
+				if (x < 1.0) {
+					// parabolic bowl
+					f += dr * (x * x - 1.0);
+					df += dr * 2.0 * x;
+					// central peak
+					if (h01(r6) < 0.35) {
+						float pk = 0.45 * dr * exp(-(x * x) / 0.02);
+						f += pk;
+						df += pk * (-2.0 * x / 0.02);
+					}
+				} else {
+					// ejecta blanket: ~1/x^3 falloff, faded out by the lookup cutoff
+					float u = clamp((x - 1.2) / 0.7, 0.0, 1.0);
+					float sm = u * u * (3.0 - 2.0 * u);
+					float dsm = x > 1.2 ? 6.0 * u * (1.0 - u) / 0.7 : 0.0;
+					float e0 = 0.10 * dr * pow(x, -3.0);
+					f += e0 * (1.0 - sm);
+					df += (-3.0 * e0 / x) * (1.0 - sm) - e0 * dsm;
+				}
+				acc.x += fade * R * f;
+				acc.yzw += fade * df * (dv / dl);
+			}
+		}
+	}
+	return acc;
+}
+
+void vertex() {
+	v_col = COLOR.rgb;
+
+	// ---- terrain displacement (see vertex displacement above) ----
+	float vd = length(VERTEX);                       // distance from the mesh centre
+	if (vtx_amount > 0.0 && vd < 40000.0) {
+		float s = max(vd, vtx_first_ring) * vtx_spread;   // local vertex spacing
+		vec3 pA = VERTEX + vmo_a;
+		vec3 pB = VERTEX + vmo_b;
+		vec4 hg = vec4(0.0);
+		hg += vcrater_layer(pB, 1024.0, 255, 11u, s);
+		hg += vcrater_layer(pB, 128.0, 2047, 23u, s);
+		hg += bump_layer(pA, 16.0, 255, 31u, s);
+		hg += bump_layer(pA, 4.0, 1023, 47u, s);
+		hg += und_octave(pB, 128.0, 2047, 59u, s);
+		hg += und_octave(pB, 32.0, 8191, 71u, s);
+		hg += und_octave(pA, 8.0, 511, 83u, s);
+		hg += und_octave(pA, 2.0, 2047, 97u, s);
+
+		// Mid/far relief: big craters with rims, ejecta and central peaks, plus broad rolling
+		// terrain. Weighted to zero inside 300 m so collision (which mirrors only the layers
+		// above) always matches what you see where you can stand.
+		float wf = smoothstep(300.0, 700.0, vd) * vtx_far_amount;
+		if (wf > 0.0) {
+			vec4 hf = vec4(0.0);
+			hf += vcrater_real(pB, 16384.0, 15, 101u, s, vtx_far_crater_density * 0.6, 0.55);
+			hf += vcrater_real(pB, 8192.0, 31, 107u, s, vtx_far_crater_density * 0.8, 0.7);
+			hf += vcrater_real(pB, 4096.0, 63, 113u, s, vtx_far_crater_density, 0.85);
+			hf += vcrater_real(pB, 2048.0, 127, 127u, s, vtx_far_crater_density, 1.0);
+			hf += und_octave(pB, 4096.0, 63, 131u, s);
+			hf += und_octave(pB, 1024.0, 255, 137u, s);
+			hf += und_octave(pB, 512.0, 511, 139u, s);
+			hf += und_octave(pB, 256.0, 1023, 149u, s);
+			hg += hf * (wf / max(vtx_amount, 1e-4));   // cancels the vtx_amount scaling below
+		}
+		hg *= vtx_amount;
+
+		vec3 up = normalize(VERTEX + vmo_full);
+		VERTEX += up * hg.x;
+
+		// smooth shading: tilt the normal by the displacement's analytic slope
+		vec3 g = hg.yzw;
+		g -= NORMAL * dot(g, NORMAL);
+		NORMAL = normalize(NORMAL - g);
+	}
+}
+
+// ------------------------------------------------------------------ helpers
+float hash13(vec3 p3) {
+	p3 = fract(p3 * 0.1031);
+	p3 += dot(p3, p3.zyx + 31.32);
+	return fract((p3.x + p3.y) * p3.z);
+}
+
+vec3 hash33(vec3 p3) {
+	p3 = fract(p3 * vec3(0.1031, 0.1030, 0.0973));
+	p3 += dot(p3, p3.yxz + 33.33);
+	return fract((p3.xxy + p3.yxx) * p3.zyx);
+}
+
+vec3 srgb_to_linear(vec3 c) {
+	vec3 lo = c / 12.92;
+	vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+	return mix(hi, lo, step(c, vec3(0.04045)));
+}
+
+// Posterize x (0..1) into `levels` flat steps with softly anti-aliased edges.
+float soft_quant(float x, float levels, float soft) {
+	float v = clamp(x, 0.0, 1.0) * levels;
+	float i = floor(v);
+	float f = fract(v);
+	return (i + smoothstep(0.5 - soft, 0.5 + soft, f)) / levels;
+}
+
+// soft_quant, fading from flat steps (color_blend = 0) to a smooth gradient (color_blend = 1).
+float blend_quant(float x, float levels, float soft) {
+	return mix(soft_quant(x, levels, soft), clamp(x, 0.0, 1.0), color_blend);
+}
+
+// Palette segment weight: eased (flat plateaus at each stop) -> linear (colors flow into each other).
+float ramp_w(float t, float a, float b) {
+	float x = clamp((t - a) / (b - a), 0.0, 1.0);
+	return mix(smoothstep(0.0, 1.0, x), x, color_blend);
+}
+
+vec3 palette_ramp(float t) {
+	vec3 c = mix(pal0, pal1, ramp_w(t, 0.0, 0.33));
+	c = mix(c, pal2, ramp_w(t, 0.33, 0.66));
+	c = mix(c, pal3, ramp_w(t, 0.66, 1.0));
+	return c;
+}
+
+// 3D value noise on a lattice that wraps every N cells, with analytic derivatives.
+// Returns (value 0..1, d/dp) where p is in lattice (cell) units.
+vec4 vnoise(vec3 p, float N) {
+	vec3 i = floor(p);
+	vec3 f = p - i;
+	vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	vec3 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+	float a = hash13(mod(i + vec3(0.0, 0.0, 0.0), N));
+	float b = hash13(mod(i + vec3(1.0, 0.0, 0.0), N));
+	float c = hash13(mod(i + vec3(0.0, 1.0, 0.0), N));
+	float d = hash13(mod(i + vec3(1.0, 1.0, 0.0), N));
+	float e = hash13(mod(i + vec3(0.0, 0.0, 1.0), N));
+	float f1 = hash13(mod(i + vec3(1.0, 0.0, 1.0), N));
+	float g = hash13(mod(i + vec3(0.0, 1.0, 1.0), N));
+	float h = hash13(mod(i + vec3(1.0, 1.0, 1.0), N));
+
+	float k1 = b - a;
+	float k2 = c - a;
+	float k3 = e - a;
+	float k4 = a - b - c + d;
+	float k5 = a - c - e + g;
+	float k6 = a - b - e + f1;
+	float k7 = -a + b + c - d + e - f1 - g + h;
+
+	float v = a + k1 * u.x + k2 * u.y + k3 * u.z
+			+ k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x
+			+ k7 * u.x * u.y * u.z;
+	vec3 dv = du * vec3(
+			k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+			k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+			k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+	return vec4(v, dv);
+}
+
+// ------------------------------------------------------------------ surface layers
+// Each returns (height_m, d/dx, d/dy, d/dz) in world units.
+
+vec4 regolith(vec3 pA, float px) {
+	float h = 0.0;
+	vec3 g = vec3(0.0);
+	float cell = 4.0;
+	for (int o = 0; o < 5; o++) {
+		float fade = smoothstep(2.0 * px, 8.0 * px, cell);
+		if (fade <= 0.0) {
+			break;
+		}
+		// slope tapers off at small scales so close-up relief is smooth, not grainy
+		float amp = 0.10 * cell * fade * smoothstep(0.15, 1.0, cell);
+		vec4 n = vnoise(pA / cell + float(o) * 37.0, 4096.0 / cell);
+		h += amp * (n.x - 0.5);
+		g += amp * n.yzw / cell;
+		cell *= 0.5;
+	}
+	return vec4(h, g);
+}
+
+// One scale of impact craters (8 nearest cells of a jittered 3D grid).
+// bright = fresh-ejecta strength, ring = rim outline strength.
+vec4 crater_layer(vec3 p, float cell, float period, float seed, float px, out float bright, out float ring) {
+	bright = 0.0;
+	ring = 0.0;
+	float fade = smoothstep(2.0 * px, 8.0 * px, cell * 0.27);
+	if (fade <= 0.0 || crater_density <= 0.0) {
+		return vec4(0.0);
+	}
+	vec3 q = p / cell;
+	vec3 i0 = floor(q);
+	vec3 s = step(vec3(0.5), q - i0) * 2.0 - 1.0;
+	float N = period / cell;
+	vec4 acc = vec4(0.0);
+
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			for (int c = 0; c < 2; c++) {
+				vec3 cc = i0 + vec3(float(a), float(b), float(c)) * s;
+				vec3 cw = mod(cc, N) + seed;
+				vec3 r1 = hash33(cw);
+				vec3 r2 = hash33(cw + vec3(19.19, 7.7, 3.3));
+				if (r2.y > crater_density) {
+					continue;
+				}
+				vec3 center = cc + 0.15 + 0.7 * r1;
+				vec3 dv = (q - center) * cell;
+				float len = max(length(dv), 1e-4);
+				float R = cell * (0.07 + 0.2 * r2.x);
+				float x = len / R;
+				if (x > 1.9) {
+					continue;
+				}
+				float dr = mix(0.06, 0.2, r2.z);
+				float inside = x < 1.0 ? 1.0 : 0.0;
+				float t = (x - 1.0) / 0.3;
+				float rim = 0.35 * dr * exp(-t * t);
+				float f = inside * dr * (x * x - 1.0) + rim;
+				float df = inside * dr * 2.0 * x + rim * (-2.0 * t / 0.3);
+				acc.x += fade * R * f;
+				acc.yzw += fade * df * (dv / len);
+
+				float fresh = pow(r2.z, 3.0) * (1.0 - smoothstep(0.8, 1.9, x));
+				bright = max(bright, fade * fresh);
+				float u = (x - 1.0) / 0.09;
+				ring = max(ring, fade * exp(-u * u));
+			}
+		}
+	}
+	return acc;
+}
+
+// One scale of boulders. tone = lighter/darker than soil, ink = dark contact edge.
+vec4 rock_layer(vec3 p, float cell, float period, float seed, float px, out float tone, out float ink) {
+	tone = 0.0;
+	ink = 0.0;
+	float fade = smoothstep(2.0 * px, 6.0 * px, cell * 0.25);
+	if (fade <= 0.0 || rock_density <= 0.0) {
+		return vec4(0.0);
+	}
+	vec3 q = p / cell;
+	vec3 i0 = floor(q);
+	vec3 s = step(vec3(0.5), q - i0) * 2.0 - 1.0;
+	float N = period / cell;
+	vec4 acc = vec4(0.0);
+
+	for (int a = 0; a < 2; a++) {
+		for (int b = 0; b < 2; b++) {
+			for (int c = 0; c < 2; c++) {
+				vec3 cc = i0 + vec3(float(a), float(b), float(c)) * s;
+				vec3 cw = mod(cc, N) + seed;
+				vec3 r1 = hash33(cw);
+				vec3 r2 = hash33(cw + vec3(5.5, 91.1, 12.7));
+				if (r2.y > rock_density) {
+					continue;
+				}
+				vec3 center = cc + 0.2 + 0.6 * r1;
+				vec3 dv = (q - center) * cell;
+				float R = cell * (0.08 + 0.17 * r2.x * r2.x);
+				float d2 = dot(dv, dv) / (R * R);
+				if (d2 >= 1.0) {
+					continue;
+				}
+				acc.x += fade * 0.8 * R * (1.0 - d2);
+				acc.yzw += fade * (-1.6 * dv / R);
+				tone += fade * (r2.z * 2.0 - 1.0);
+				ink = max(ink, fade * smoothstep(0.55, 0.98, d2));
+			}
+		}
+	}
+	return acc;
+}
+
+// ------------------------------------------------------------------ shading
+const float MOON_R_KM = 1737.4;
+
+// Elevation in real km relative to the datum, from heightmap mip `lod`.
+float topo_km(vec3 d, float lod) {
+	float lon = atan(d.x, d.z);
+	float lat = asin(clamp(d.y, -1.0, 1.0));
+	vec2 uv = vec2(lon / TAU + 0.5, clamp(0.5 - lat / PI, 0.0005, 0.9995));
+	return (textureLod(height_tex, uv, lod).r - h_mean) * km_per_unit;
+}
+
+// Slope (rise/run, in real units) over a baseline of 2 texels at mip `lod`.
+float topo_slope(vec3 d, float lod) {
+	vec3 up = abs(d.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+	vec3 t1 = normalize(cross(up, d));
+	vec3 t2 = cross(d, t1);
+	float a = (PI / tex_size.y) * exp2(lod);
+	float ca = cos(a);
+	float sa = sin(a);
+	float h1 = topo_km(d * ca + t1 * sa, lod);
+	float h2 = topo_km(d * ca - t1 * sa, lod);
+	float h3 = topo_km(d * ca + t2 * sa, lod);
+	float h4 = topo_km(d * ca - t2 * sa, lod);
+	return length(vec2(h1 - h2, h3 - h4)) / (2.0 * a * MOON_R_KM);
+}
+
+void fragment() {
+	vec3 wp = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 pA = wp + off_a;
+	vec3 pB = wp + off_b;
+
+	float px = max(length(VERTEX) * 2.0 / (PROJECTION_MATRIX[1][1] * VIEWPORT_SIZE.y), 1e-4);
+
+	vec4 hg = vec4(0.0);
+	float bright = 0.0;
+	float ring = 0.0;
+	float tone = 0.0;
+	float ink = 0.0;
+	float b = 0.0;
+	float r = 0.0;
+
+	hg += crater_layer(pB, 256.0, 262144.0, 0.0, px, b, r) * crater_amount;   bright = max(bright, b); ring = max(ring, r);
+	hg += crater_layer(pB, 64.0, 262144.0, 11.0, px, b, r) * crater_amount;   bright = max(bright, b); ring = max(ring, r);
+	hg += crater_layer(pA, 16.0, 4096.0, 23.0, px, b, r) * crater_amount;     bright = max(bright, b); ring = max(ring, r);
+	hg += crater_layer(pA, 4.0, 4096.0, 37.0, px, b, r) * crater_amount;      bright = max(bright, b); ring = max(ring, r);
+	hg += crater_layer(pA, 1.0, 4096.0, 53.0, px, b, r) * crater_amount;      bright = max(bright, b); ring = max(ring, r);
+
+	hg += rock_layer(pA, 8.0, 4096.0, 67.0, px, b, r) * rock_amount;          tone += b; ink = max(ink, r);
+	hg += rock_layer(pA, 2.0, 4096.0, 79.0, px, b, r) * rock_amount;          tone += b; ink = max(ink, r);
+
+	hg += regolith(pA, px) * regolith_amount;
+
+	// ---- normal: n' = n - tangential slope ----
+	vec3 nw = normalize((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).xyz);
+	vec3 g = hg.yzw * detail_normal;
+	g -= nw * dot(g, nw);
+	float gl = length(g);
+	g *= min(1.0, 3.0 / max(gl, 1e-4));
+	nw = normalize(nw - g);
+	NORMAL = normalize((VIEW_MATRIX * vec4(nw, 0.0)).xyz);
+
+	// ---- albedo: color map -> palette -> flat steps ----
+	vec3 base = mix(fallback_color, srgb_to_linear(v_col), use_vertex_color);
+	float l = dot(base, vec3(0.2126, 0.7152, 0.0722));
+	base = max(mix(vec3(l), base, color_saturation), vec3(0.0));
+
+	float t = clamp((l - lum_min) / max(lum_max - lum_min, 1e-4), 0.0, 1.0);
+
+	float dist = length(VERTEX);
+	float w_map = smoothstep(map_fade_start, map_fade_end, dist);
+
+	// Topography-derived darkness replaces the color map. Skipped up close, where the map is
+	// ignored anyway. Sampled at a mip matched to the pixel footprint so it never aliases.
+	if (use_topo_albedo > 0.5 && w_map > 0.0) {
+		vec3 d = normalize(wp + off_full);
+		float lod_px = max(log2(px / texel_m), 0.0);
+		float z_km = topo_km(d, lod_px);                                   // elevation vs. datum
+		float s_fine = degrees(atan(topo_slope(d, lod_px)));               // local slope
+		float s_rough = degrees(atan(topo_slope(d, max(lod_px, rough_lod))));   // km-scale roughness
+
+		float p_low = 1.0 - smoothstep(mare_elev_full_km, mare_elev_none_km, z_km);
+		float p_smooth = 1.0 - smoothstep(smooth_full_deg, smooth_none_deg, s_rough);
+		// mare = low AND smooth. Low-but-rough (e.g. South Pole-Aitken floor) is only partly dark.
+		float p_mare = p_low * mix(lowland_rough_floor, 1.0, p_smooth);
+
+		float A = mix(albedo_highland, albedo_mare, p_mare);
+		// steep slopes shed mature regolith -> brighter, fresher material
+		A *= 1.0 + slope_bright_gain * smoothstep(slope_bright_start_deg, slope_bright_full_deg, s_fine);
+
+		t = clamp((A - albedo_dark) / max(albedo_bright - albedo_dark, 1e-4), 0.0, 1.0);
+	}
+	float tq = blend_quant(t, float(palette_steps), 0.15);
+	float f2 = smoothstep(px, 6.0 * px, 1.0);
+	float n1 = vnoise(pA / 8.0 + 101.0, 512.0).x;
+	float n2 = vnoise(pA / 4.0 + 211.0, 1024.0).x;   // 4 m scale (was 1 m: grainy)
+
+	// Far away: color map pushed through the palette.
+	vec3 map_col = mix(base, palette_ramp(tq), use_topo_albedo > 0.5 ? 1.0 : palette_mix);
+
+	// Photo map wrapped around the globe. Sampled at a mip matched to the pixel footprint
+	// (explicit lod avoids a mip seam where longitude wraps) and skipped when it is faded out anyway.
+	if (tex_amount > 0.0 && w_map > 0.0) {
+		vec3 dtx = normalize(wp + off_full);
+		vec2 tuv = vec2(atan(dtx.x, dtx.z) / TAU + 0.5, clamp(0.5 - asin(clamp(dtx.y, -1.0, 1.0)) / PI, 0.0005, 0.9995));
+		float graze = 1.0 / max(abs(dot(normalize(NORMAL), normalize(VIEW))), 0.1);   // footprint stretch at grazing angles
+		float tlod = max(log2(px / texel_m) + 0.5 * log2(graze) + tex_lod_bias, 0.0);
+		float tv = textureLod(moon_tex, tuv, tlod).r;
+		tv = clamp((tv - 0.18) * tex_contrast + 0.18, 0.0, 1.0) * tex_gain;
+		map_col = mix(map_col, tv * tex_tint, tex_amount);
+	}
+
+	// Up close: the Moon's global color map is ignored completely; the surface colors itself
+	// from the same palette using only its own patch noise. Blends back to the map by map_fade_end.
+	// (dist is computed earlier, with the topography model)
+	
+	float t_close = clamp(close_value + close_variation * (1.1 * (blend_quant(n1, 3.0, 0.12) - 0.5) + 0.8 * (blend_quant(n2, 3.0, 0.12) - 0.5) * f2), 0.0, 1.0);
+	vec3 close_col = palette_ramp(blend_quant(t_close, float(palette_steps), 0.15));
+	base = mix(close_col, map_col, w_map);
+
+	// blocky albedo patches instead of smooth noise
+	// (n1 is sampled earlier, with the close-range color)
+	float n4 = vnoise(pB / 128.0 + 401.0, 2048.0).x;
+	float fp1 = smoothstep(px, 6.0 * px, 8.0);      // fade patch noise once a pixel is bigger than the patch
+	float fp4 = smoothstep(px, 6.0 * px, 128.0);
+	float patch1 = (blend_quant(n1, 3.0, 0.12) - 0.5) * fp1;
+	float patch4 = (blend_quant(n4, 3.0, 0.12) - 0.5) * fp4;
+	vec3 tint = mix(vec3(1.0), mix(vec3(1.04, 1.0, 0.94), vec3(0.95, 0.99, 1.06), blend_quant(n1, 2.0, 0.1)), fp1);
+
+	vec3 alb = base * albedo_gain * (1.0 + detail_albedo * (0.8 * patch4 + 0.6 * patch1));
+	alb *= mix(vec3(1.0), tint, detail_albedo);
+
+	// fresh-crater ejecta: flat cream splash
+	alb = mix(alb, pal3, 0.55 * blend_quant(bright, 2.0, 0.15));
+	// boulders: flat lighter / darker value
+	float rtone = blend_quant(clamp(tone, -1.0, 1.0) * 0.5 + 0.5, 3.0, 0.1) - 0.5;
+	alb *= 1.0 + 0.4 * rtone * detail_albedo;
+	// ink outlines on crater rims and boulder bases
+	alb = mix(alb, ink_color, ink_strength * max(ring, 0.8 * ink));
+
+	ALBEDO = clamp(alb, 0.0, 1.0);
+	ROUGHNESS = 1.0;
+}
+
+// Banded toon lighting with a tinted shadow side and a thin rim light.
+void light() {
+	float lit = clamp(dot(NORMAL, LIGHT), 0.0, 1.0) * ATTENUATION;
+	float q = mix(soft_quant(lit, float(light_bands), band_softness), lit, light_blend);
+	vec3 lc = LIGHT_COLOR / PI;
+
+	float rim = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 3.0);
+
+	DIFFUSE_LIGHT += lc * q;
+	DIFFUSE_LIGHT += lc * shadow_tint * shadow_fill * (1.0 - q);
+	DIFFUSE_LIGHT += lc * rim_color * rim_strength * rim * q;
+}
+
