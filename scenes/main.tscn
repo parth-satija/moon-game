@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://3btcpa2jyxpu"]
+
+[ext_resource type="Script" uid="uid://dvcu22064dhq1" path="res://scripts/moon.gd" id="1_o5qli"]
+
+[node name="Node3D" type="Node3D" unique_id=915632085]
+script = ExtResource("1_o5qli")
