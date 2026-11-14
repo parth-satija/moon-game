@@ -1,0 +1,10 @@
+{
+  "width": 8192,
+  "height": 4096,
+  "radius_min": 95.6361312866211,
+  "radius_max": 97.8339614868164,
+  "mean_radius": 96.49626159667969,
+  "color_source": "texture",
+  "color_width": 8192,
+  "color_height": 4096
+}
