@@ -18,6 +18,13 @@ var _hover := Vector2.INF       # disc coords (x east, y north, -1..1), INF = no
 var _selected := Vector2.INF
 var _lon_deg := 0.0
 var _lat_deg := 0.0
+var _severity := 0
+var _warn_panel: PanelContainer
+var _warn_title: Label
+var _warn_body: Label
+
+const SEVERITY_COLORS := [Color(0.45, 0.85, 0.6), Color(1.0, 0.7, 0.25), Color(1.0, 0.3, 0.28)]
+const SEVERITY_TITLES := ["Site conditions: manageable", "Site conditions: caution", "Site conditions: dangerous"]
 
 
 func _ready() -> void:
@@ -26,6 +33,7 @@ func _ready() -> void:
 	globe.mouse_exited.connect(_on_globe_exited)
 	marker.draw.connect(_draw_marker)
 	confirm_button.pressed.connect(_confirm)
+	_build_warnings()
 	_layout()
 
 
@@ -81,6 +89,7 @@ func _on_globe_input(event: InputEvent) -> void:
 		_lon_deg = ll.x
 		_lat_deg = ll.y
 		confirm_button.disabled = false
+		_update_warnings()
 		_update_readout()
 		marker.queue_redraw()
 
@@ -89,6 +98,49 @@ func _on_globe_exited() -> void:
 	_hover = Vector2.INF
 	_update_readout()
 	marker.queue_redraw()
+
+
+# Warnings for the chosen site: heat / cold for the suit and radio coverage (see MoonSystems.site_forecast).
+func _build_warnings() -> void:
+	_warn_panel = PanelContainer.new()
+	_warn_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_warn_panel.anchor_left = 0.0
+	_warn_panel.anchor_right = 0.0
+	_warn_panel.offset_left = 20.0
+	_warn_panel.offset_right = 380.0
+	_warn_panel.offset_top = 80.0
+	_warn_panel.offset_bottom = 80.0
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.03, 0.04, 0.07, 0.82)
+	sb.border_color = Color(0.55, 0.65, 0.8, 0.5)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(12.0)
+	_warn_panel.add_theme_stylebox_override("panel", sb)
+	var box := VBoxContainer.new()
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.custom_minimum_size = Vector2(336.0, 0.0)
+	box.add_theme_constant_override("separation", 6)
+	_warn_panel.add_child(box)
+	_warn_title = Label.new()
+	_warn_title.add_theme_font_size_override("font_size", 17)
+	box.add_child(_warn_title)
+	_warn_body = Label.new()
+	_warn_body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_warn_body.add_theme_font_size_override("font_size", 14)
+	_warn_body.add_theme_color_override("font_color", Color(0.85, 0.88, 0.95))
+	box.add_child(_warn_body)
+	_warn_panel.visible = false
+	add_child(_warn_panel)
+
+
+func _update_warnings() -> void:
+	var f := MoonSystems.site_forecast(_lon_deg, _lat_deg)
+	_severity = clampi(int(f["severity"]), 0, 2)
+	_warn_title.text = SEVERITY_TITLES[_severity]
+	_warn_title.add_theme_color_override("font_color", SEVERITY_COLORS[_severity])
+	_warn_body.text = "\n\n".join(f["lines"])
+	_warn_panel.visible = true
 
 
 func _update_readout() -> void:
@@ -110,7 +162,7 @@ func _draw_marker() -> void:
 		marker.draw_arc(_disc_to_local(_hover), 7.0, 0.0, TAU, 24, Color(1, 1, 1, 0.6), 1.5, true)
 	if _selected != Vector2.INF:
 		var c := _disc_to_local(_selected)
-		var col := Color(1.0, 0.55, 0.1)
+		var col: Color = SEVERITY_COLORS[_severity] if _severity > 0 else Color(1.0, 0.55, 0.1)
 		marker.draw_arc(c, 11.0, 0.0, TAU, 32, col, 2.5, true)
 		marker.draw_line(c + Vector2(-18, 0), c + Vector2(-6, 0), col, 2.0, true)
 		marker.draw_line(c + Vector2(6, 0), c + Vector2(18, 0), col, 2.0, true)

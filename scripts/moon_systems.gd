@@ -523,6 +523,89 @@ func _find_env(n: Node) -> LunarEnvironment:
 	return null
 
 
+# ================================================================= site forecast (landing-site picker)
+
+## What a landing site will be like, for the picker. Returns {"lines": Array[String], "severity": 0..2}.
+## It uses the Sun as the LunarEnvironment script sets it up (its defaults; a scene that overrides them is not seen),
+## the same suit heat balance and drain curves as the game, and the Earth's position (libration ignored).
+static func site_forecast(lon_deg: float, lat_deg: float) -> Dictionary:
+	var env := LunarEnvironment.new()
+	var sun_lon := env.subsolar_longitude_deg
+	var sun_lat := env.subsolar_latitude_deg
+	var moving := env.day_cycle_enabled or FORCE_DAY_CYCLE
+	env.free()
+	var lines: Array[String] = []
+	var severity := 0
+
+	# --- heat and cold
+	var lat := deg_to_rad(lat_deg)
+	var sl := deg_to_rad(sun_lat)
+	var elev := rad_to_deg(asin(clampf(sin(lat) * sin(sl) + cos(lat) * cos(sl) * cos(deg_to_rad(lon_deg - sun_lon)), -1.0, 1.0)))
+	if moving:
+		var noon := _suit_report(rad_to_deg(asin(clampf(cos(lat - sl), -1.0, 1.0))))
+		var night := _suit_report(-10.0)
+		lines.append("The Sun crosses the sky: noon heat and night cold both reach the suit.")
+		lines.append("Noon: %s" % str(noon["text"]))
+		lines.append("Night: %s" % str(night["text"]))
+		severity = maxi(int(noon["severity"]), int(night["severity"]))
+	else:
+		var r := _suit_report(elev)
+		lines.append("Sun %d° above the horizon (fixed): %s" % [int(round(elev)), str(r["text"])])
+		severity = int(r["severity"])
+
+	# --- radio
+	var earth_elev := rad_to_deg(asin(clampf(cos(lat) * cos(deg_to_rad(lon_deg)), -1.0, 1.0)))
+	if earth_elev < 5.0:
+		lines.append("Earth only %d° up: terrain will often block the direct link; only a weak relay link remains." % int(round(earth_elev)))
+		severity = maxi(severity, 2)
+	elif earth_elev < 15.0:
+		lines.append("Earth low (%d°): hills can cut the direct link; expect a weaker signal." % int(round(earth_elev)))
+		severity = maxi(severity, 1)
+	else:
+		lines.append("Earth %d° up: clear line to Earth." % int(round(earth_elev)))
+	lines.append("The base is 1-20 km away. Signal fades past ~10 km from the base or the crash relay, and Mission Control turns to static.")
+	return {"lines": lines, "severity": severity}
+
+
+# One condition: {"text", "severity"} for a Sun elevation (<= 0 is night).
+static func _suit_report(elev_deg: float) -> Dictionary:
+	var ground := 95.0
+	if elev_deg > 0.5:
+		ground = maxf(390.0 * pow(sin(deg_to_rad(elev_deg)), 0.25), 95.0)
+	var t := _suit_eq_k(elev_deg, ground)
+	var drain := 0.0
+	var word := "comfortable"
+	if t > COMFORT_HOT_K:
+		drain = _curve(HOT_CURVE, t - COMFORT_HOT_K)
+		word = "overheating"
+	elif t < COMFORT_COLD_K:
+		drain = _curve(COLD_CURVE, COMFORT_COLD_K - t)
+		word = "too cold"
+	var text := "ground %d °C, suit %d °C, %s." % [int(round(ground - 273.15)), int(round(t - 273.15)), word]
+	var sev := 0
+	if drain > 0.0:
+		var minutes := 1.0 / drain / 60.0
+		text += " The thermal reserve lasts about %d min outdoors." % int(round(minutes))
+		sev = 2 if minutes < 6.0 else 1
+	return {"text": text, "severity": sev}
+
+
+# Steady-state suit temperature (same balance as MoonThermal's Equipment).
+static func _suit_eq_k(elev_deg: float, ground_k: float) -> float:
+	var area: float = SUIT_PROPS["area_m2"]
+	var k := 5.670374e-8 * float(SUIT_PROPS["emissivity"]) * area
+	var sun_w := 0.0
+	if elev_deg > 0.0:
+		sun_w = float(SUIT_PROPS["absorptivity"]) * 1361.0 * area * (0.25 + 0.5 * sin(deg_to_rad(elev_deg)))
+	var t := 295.0
+	for i in 60:
+		var heat: float = float(SUIT_PROPS["internal_w"]) + sun_w + 0.4 * k * pow(ground_k, 4.0)
+		if t < float(SUIT_PROPS["heater_on_k"]):
+			heat += float(SUIT_PROPS["heater_w"])
+		t = lerpf(t, pow(heat / k, 0.25), 0.5)
+	return t
+
+
 # ================================================================= debug
 
 func _unhandled_input(event: InputEvent) -> void:

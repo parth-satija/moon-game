@@ -126,6 +126,7 @@ func launch_to_docking() -> void:
 		return
 	save_now()
 	LunarNav.end_session()
+	MoonSystems.end_session()
 	in_game = false
 	_moon = null
 	Inventory.ui_open = false
@@ -301,6 +302,7 @@ func quit_game() -> void:
 
 func _end_session() -> void:
 	LunarNav.end_session()
+	MoonSystems.end_session()
 	active = false
 	in_game = false
 	current_slot = 0
@@ -327,6 +329,9 @@ func save_now() -> void:
 			_save["player"] = state
 		_record_driven_vehicle()
 		_record_inside_base()
+		var systems := MoonSystems.get_state()
+		if not systems.is_empty():
+			_save["systems"] = systems
 	if _write_json(slot_path(current_slot), _save):
 		saved.emit(current_slot)
 
@@ -436,7 +441,6 @@ func _on_game_planet_ready(moon: MoonPlanet) -> void:
 	_moon = moon
 	in_game = true
 	_autosave_t = 0.0
-	_hide_loading()
 
 	if str(_save.get("stage", "")) != "playing":        # first arrival after the crash: remember it
 		_save["crash"] = _snapshot_crash()
@@ -448,6 +452,8 @@ func _on_game_planet_ready(moon: MoonPlanet) -> void:
 	LunarNav.begin_session(_save, moon)
 	_resume_driving(moon)
 	_resume_inside(moon)
+	MoonSystems.begin_session(_save.get("systems", {}), moon)      # heat + radio; its probes take a moment, so the loading screen stays up
+	_hide_loading()
 	save_now()
 
 

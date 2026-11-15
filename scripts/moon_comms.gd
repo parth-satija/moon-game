@@ -50,10 +50,23 @@ const LIB_LAT_MAX_DEG := 6.7
 @export var derate_db_per_k: float = 0.15
 @export var region_center_world: Vector3 = Vector3.ZERO
 @export var world_units_per_meter: float = 1.0
+@export var center_lat_deg: float = 0.0           # selenographic position of the region centre when no Terrain is loaded
+@export var center_lon_deg: float = 0.0
+@export var horizon_step_m: float = 100.0         # sample spacing of the Earth-horizon scan (raise it to scan faster)
+@export var derate_cold_below_k: float = 230.0    # frozen electronics lose transmit power too
+@export var derate_cold_db_per_k: float = 0.08
+@export var orbital_relay_enabled: bool = false   # a relay satellite gives a weak fallback when Earth is below the horizon or masked
+@export var orbital_relay_snr_db: float = 14.0
+@export var orbital_relay_rate_bps: float = 2.0e6
+@export var orbital_relay_delay_s: float = 0.1
+@export var clear_snr_db: float = 24.0            # SNR at which link_quality() reaches 1
 
 var sim_time_s: float = 0.0
 var terrain: Terrain = null
 var signal_map: SignalMap = null
+## Optional terrain source: func(east_m: float, north_m: float) -> float, elevation in metres above the 1737.4 km
+## reference sphere at a point of the flat region frame. Used when no Terrain grid is loaded.
+var height_provider := Callable()
 
 var _radios: Dictionary = {}
 var _links: Dictionary = {}
@@ -62,6 +75,8 @@ var _adj: Dictionary = {}
 var _routes: Dictionary = {}
 var _was_connected: Dictionary = {}
 var _acc: float = 0.0
+var _best_snr: Dictionary = {}
+var _snr_hop: Dictionary = {}
 
 
 # ================================================================== data classes
@@ -258,13 +273,15 @@ func _local(world: Vector3) -> Vector2:
 
 func _update_latlon(r: Radio) -> void:
 	var e := _local(r.pos)
-	var clat := terrain.center_lat if terrain else 0.0
-	var clon := terrain.center_lon if terrain else 0.0
+	var clat := terrain.center_lat if terrain else center_lat_deg
+	var clon := terrain.center_lon if terrain else center_lon_deg
 	r.lat_deg = clat + rad_to_deg(e.y / R_MOON_M)
 	r.lon_deg = clon + rad_to_deg(e.x / (R_MOON_M * maxf(cos(deg_to_rad(r.lat_deg)), 0.01)))
 
 
 func _raw(p: Vector2) -> float:
+	if height_provider.is_valid():
+		return float(height_provider.call(p.x, p.y))
 	if terrain == null:
 		return 0.0
 	var h := terrain.height_m(p.x, p.y)
@@ -367,7 +384,7 @@ func _horizon_deg(r: Radio, az_deg: float) -> float:
 	var p0 := _local(r.pos)
 	var z0 := _raw(p0) + r.mast_m
 	var dir := Vector2(sin(deg_to_rad(az_deg)), cos(deg_to_rad(az_deg)))
-	var step := terrain.px_m if terrain else 100.0
+	var step := maxf(terrain.px_m if terrain else 0.0, horizon_step_m)
 	var best := -90.0
 	var s := step
 	while s <= earth_horizon_scan_km * 1000.0:
@@ -390,15 +407,28 @@ func evaluate_earth_link(r: Radio) -> Link:
 	var elev: float = es["elev_deg"]
 	if elev <= 0.0:
 		ln.los = false
-		return ln
+		return _relay_fallback(r, ln)
 	ln.los = elev > _horizon_deg(r, float(es["az_deg"])) + earth_clearance_deg
 	if not ln.los:
-		return ln
+		return _relay_fallback(r, ln)
 	ln.fspl_db = 20.0 * log(4.0 * PI * ln.dist_m * freq_hz / C_LIGHT) / LN10
 	ln.rx_dbm = r.dte_tx_dbm - r.derate_db + r.dte_gain_dbi + earth_station_gain_dbi - ln.fspl_db
 	ln.snr_db = ln.rx_dbm - _noise_dbm(r.dte_bandwidth_hz, earth_station_nf_db)
 	ln.rate_bps = _rate_bps(ln.snr_db, r.dte_bandwidth_hz, r.dte_max_rate_bps)
 	ln.bars = _bars(ln.snr_db)
+	return ln
+
+
+## Earth is below the horizon or behind terrain: with a relay satellite enabled the radio still gets a weak link.
+func _relay_fallback(r: Radio, ln: Link) -> Link:
+	if not orbital_relay_enabled:
+		return ln
+	ln.los = true
+	ln.snr_db = orbital_relay_snr_db - r.derate_db
+	ln.rx_dbm = ln.snr_db + _noise_dbm(r.dte_bandwidth_hz, earth_station_nf_db)
+	ln.rate_bps = _rate_bps(ln.snr_db, r.dte_bandwidth_hz, minf(r.dte_max_rate_bps, orbital_relay_rate_bps))
+	ln.bars = _bars(ln.snr_db)
+	ln.latency_s += orbital_relay_delay_s
 	return ln
 
 
@@ -420,7 +450,9 @@ func update_network() -> void:
 			if r.equipment_id != &"":
 				var t := thermal.equipment_temp_k(r.equipment_id)
 				if not is_nan(t):
-					r.derate_db = clampf((t - derate_start_k) * derate_db_per_k, 0.0, 20.0)
+					var hot_db := maxf(t - derate_start_k, 0.0) * derate_db_per_k
+					var cold_db := maxf(derate_cold_below_k - t, 0.0) * derate_cold_db_per_k
+					r.derate_db = clampf(hot_db + cold_db, 0.0, 20.0)
 	_links.clear()
 	_earth_links.clear()
 	_adj.clear()
@@ -446,6 +478,7 @@ func update_network() -> void:
 			if el.rate_bps > 0.0:
 				_earth_links[a.id] = el
 	_compute_routes()
+	_compute_snr_routes()
 	network_updated.emit()
 
 
@@ -494,6 +527,38 @@ func _compute_routes() -> void:
 			route_changed.emit(id, now)
 
 
+## Strongest-signal route to Earth: the path whose weakest hop has the highest SNR. get_route() picks by data rate,
+## which saturates at the radios' caps and can prefer a short marginal path over a longer clean one.
+func _compute_snr_routes() -> void:
+	var best := {}
+	var hop := {}
+	var done := {}
+	for id in _earth_links:
+		best[id] = (_earth_links[id] as Link).snr_db
+		hop[id] = &"EARTH"
+	while true:
+		var cur: StringName = &""
+		var cur_snr := -INF
+		for id in best:
+			if not done.has(id) and float(best[id]) > cur_snr:
+				cur = id
+				cur_snr = float(best[id])
+		if cur == &"":
+			break
+		done[cur] = true
+		for e in _adj.get(cur, []):
+			var o: StringName = e["other"]
+			if done.has(o):
+				continue
+			var l2: Link = e["link"]
+			var s := minf(cur_snr, l2.snr_db)
+			if not best.has(o) or s > float(best[o]):
+				best[o] = s
+				hop[o] = cur
+	_best_snr = best
+	_snr_hop = hop
+
+
 # ================================================================== queries
 func get_route(id: StringName) -> Dictionary:
 	if not _routes.has(id):
@@ -518,6 +583,38 @@ func get_link(a_id: StringName, b_id: StringName) -> Link:
 
 func get_earth_link(id: StringName) -> Link:
 	return _earth_links.get(id, null)
+
+
+## SNR (dB) of the weakest hop on the strongest route from a radio to Earth; -INF when there is none.
+func best_snr_db(id: StringName) -> float:
+	return float(_best_snr.get(id, -INF))
+
+
+## 0..1 signal quality of a radio: best_snr_db() against clear_snr_db. 0 with no route.
+func link_quality(id: StringName) -> float:
+	var s := best_snr_db(id)
+	if s <= -1000.0:
+		return 0.0
+	return clampf(s / maxf(clear_snr_db, 1.0), 0.0, 1.0)
+
+
+## Node ids of the strongest route, e.g. [player, wreck, base, EARTH]; empty with no route.
+func signal_path(id: StringName) -> Array:
+	if not _snr_hop.has(id):
+		return []
+	var path: Array = [id]
+	var cur: StringName = id
+	while cur != &"EARTH" and path.size() < 32:
+		cur = _snr_hop[cur]
+		path.append(cur)
+	return path
+
+
+## Overrides Radio fields of a radio already added, e.g. {"tx_dbm": 37.0}.
+func set_radio_props(id: StringName, props: Dictionary) -> void:
+	if _radios.has(id):
+		for k in props:
+			_radios[id].set(k, props[k])
 
 
 func earth_info(id: StringName) -> Dictionary:

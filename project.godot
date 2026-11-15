@@ -25,8 +25,10 @@ InventoryUI="*res://scripts/inventory_ui.gd"
 GameState="*res://scripts/game_state.gd"
 LunarNav="*res://scripts/navigation.gd"
 NavSlate="*res://scripts/nav_slate.gd"
+MoonSystems="*res://scripts/moon_systems.gd"
 Life="*res://scripts/life.gd"
 Story="*res://scripts/story.gd"
+PlayerSwap="*res://scripts/player_swap.gd"
 
 [display]
 

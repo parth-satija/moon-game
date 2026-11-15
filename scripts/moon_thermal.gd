@@ -58,6 +58,10 @@ const COLDEST_K := 25.0                        # Diviner minimum, permanently sh
 
 var sim_time_s: float = 0.0
 var diviner: DivinerFrames = null
+## Optional sun feed: func() -> Vector3, the Sun's direction in the planet frame (X = lon 90E, Y = north pole,
+## Z = lon 0 on the equator, the frame of LunarEnvironment.get_sun_direction()). When set, every probe uses that Sun,
+## so the ground heats under the Sun the player sees, instead of the built-in lunar-day clock.
+var sun_feed := Callable()
 
 var _probes: Dictionary = {}
 var _equipment: Dictionary = {}
@@ -77,6 +81,9 @@ static func albedo(a0: float, cos_inc: float) -> float:
 
 
 func local_hour(lon_deg: float) -> float:
+	if sun_feed.is_valid():
+		var s: Vector3 = sun_feed.call()
+		return fposmod(12.0 + (lon_deg - rad_to_deg(atan2(s.x, s.z))) / 15.0, 24.0)
 	return fposmod(12.0 + (lon_deg - subsolar_lon_start_deg) / 15.0
 			+ 24.0 * sim_time_s / SYNODIC_DAY_S, 24.0)
 
@@ -99,6 +106,19 @@ func sun_direction(lat_deg: float, hour: float) -> Vector3:
 	var north := cos(phi) * sin(dec) - sin(phi) * cos(dec) * cos(h)
 	var up := sin(phi) * sin(dec) + cos(phi) * cos(dec) * cos(h)
 	return Vector3(east, up, -north).normalized()
+
+
+## The Sun in a probe's local frame (x east, y up, -z north). Follows sun_feed when one is set.
+func _sun_local(lat_deg: float, lon_deg: float) -> Vector3:
+	if not sun_feed.is_valid():
+		return sun_direction(lat_deg, local_hour(lon_deg))
+	var s: Vector3 = sun_feed.call()
+	var lat := deg_to_rad(lat_deg)
+	var lon := deg_to_rad(lon_deg)
+	var up := Vector3(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon))
+	var east := Vector3(cos(lon), 0.0, -sin(lon))
+	var north := Vector3(-sin(lat) * sin(lon), cos(lat), -sin(lat) * cos(lon))
+	return Vector3(s.dot(east), s.dot(up), -s.dot(north)).normalized()
 
 
 # ================================================================== regolith column
@@ -205,6 +225,23 @@ func add_probe(id: StringName, lat_deg: float, lon_deg: float, albedo0: float = 
 	_probes[id] = p
 
 
+## Moves a probe (a walking player, a driven rover). Its regolith column keeps its heat history.
+func move_probe(id: StringName, lat_deg: float, lon_deg: float) -> void:
+	if _probes.has(id):
+		var p: Probe = _probes[id]
+		p.lat_deg = lat_deg
+		p.lon_deg = lon_deg
+
+
+func has_probe(id: StringName) -> bool:
+	return _probes.has(id)
+
+
+## The Equipment object of an id (null if unknown), to change its power, heater or temperature at run time.
+func get_equipment(id: StringName) -> Equipment:
+	return _equipment.get(id, null)
+
+
 func set_probe_normal(id: StringName, normal: Vector3) -> void:
 	if _probes.has(id):
 		_probes[id].normal = normal.normalized()
@@ -251,7 +288,7 @@ func _advance(dt: float) -> void:
 	sim_time_s += dt
 	var flux := solar_flux()
 	for p: Probe in _probes.values():
-		var sun := sun_direction(p.lat_deg, local_hour(p.lon_deg))
+		var sun := _sun_local(p.lat_deg, p.lon_deg)
 		var cos_inc := maxf(p.normal.dot(sun), 0.0)
 		var lit := sun.y > 0.0 and cos_inc > 0.0
 		if lit and p.shadow_fn.is_valid():
@@ -268,7 +305,7 @@ func _advance(dt: float) -> void:
 	for e: Equipment in _equipment.values():
 		if _probes.has(e.probe_id):
 			var p2: Probe = _probes[e.probe_id]
-			_step_equipment(e, p2, dt, sun_direction(p2.lat_deg, local_hour(p2.lon_deg)), flux)
+			_step_equipment(e, p2, dt, _sun_local(p2.lat_deg, p2.lon_deg), flux)
 	stepped.emit(sim_time_s)
 
 
@@ -369,7 +406,7 @@ func sun_elevation_deg(id: StringName) -> float:
 	if not _probes.has(id):
 		return NAN
 	var p: Probe = _probes[id]
-	return rad_to_deg(asin(clampf(sun_direction(p.lat_deg, local_hour(p.lon_deg)).y, -1.0, 1.0)))
+	return rad_to_deg(asin(clampf(_sun_local(p.lat_deg, p.lon_deg).y, -1.0, 1.0)))
 
 
 # ================================================================== NASA Diviner frames

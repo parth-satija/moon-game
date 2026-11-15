@@ -222,7 +222,7 @@ func _build_ui() -> void:
 	column.add_theme_constant_override("separation", 28)
 	center.add_child(column)
 
-	var title := _label("MOON GAME", 64, ACCENT)
+	var title := _label("Schrodinger's Astronaut", 64, ACCENT)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	column.add_child(title)
 
