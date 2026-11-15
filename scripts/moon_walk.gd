@@ -8,7 +8,7 @@ extends Node3D
 @export var sun_direction := Vector3(0.8, 0.25, 0.45)    # world-space direction TOWARD the sun
 @export var sun_energy := 1.0
 @export var moon_shader_path := "res://scenes/moon_material.gdshader"
-@export var moon_texture_path := "res://moon_preview.png"
+@export var moon_texture_path := "res://moon_color_preview.png"
 @export var sky_shader_path := "res://scenes/star_sky.gdshader"
 
 

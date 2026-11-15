@@ -1,0 +1,14 @@
+[gd_scene load_steps=3 format=3]
+
+[sub_resource type="BoxMesh" id="BoxMesh_panel"]
+size = Vector3(10, 0.15, 4)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_panel"]
+albedo_color = Color(0.15, 0.25, 0.6, 1)
+
+[node name="SolarArray" type="Node3D"]
+
+[node name="PlaceholderMesh" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.9396926, 0.34202015, 0, -0.34202015, 0.9396926, 0, 1.5, 0)
+mesh = SubResource("BoxMesh_panel")
+surface_material_override/0 = SubResource("StandardMaterial3D_panel")

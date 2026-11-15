@@ -11,18 +11,37 @@ config_version=5
 [application]
 
 config/name="Moon Game"
-run/main_scene="uid://c5vbg6m1o26or"
+run/main_scene="res://scenes/main_menu.tscn"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
 
+[autoload]
+
+Inventory="*res://scripts/inventory.gd"
+LandingSite="*res://scripts/landing_site.gd"
+Dialogue="*res://scripts/dialogue.gd"
+Repairs="*res://scripts/repairs.gd"
+InventoryUI="*res://scripts/inventory_ui.gd"
+GameState="*res://scripts/game_state.gd"
+LunarNav="*res://scripts/navigation.gd"
+NavSlate="*res://scripts/nav_slate.gd"
+Life="*res://scripts/life.gd"
+Story="*res://scripts/story.gd"
+
 [display]
 
-window/size/viewport_width=2560
-window/size/viewport_height=1600
+window/size/viewport_width=1920
+window/size/viewport_height=1200
 
 [dotnet]
 
 project/assembly_name="Moon Game"
+
+[global_group]
+
+interactible=""
+source=""
+rover1=""
 
 [physics]
 
